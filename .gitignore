@@ -1,0 +1,14 @@
+# Local logs - never commit
+*.log
+hermes-bearer-proxy.supervisor.log
+
+# Compiled executables - these go on GitHub Releases, not in the repo
+hermes-bearer-proxy
+dist/
+*.exe
+
+# Local test scaffolding
+.test/
+
+# Just in case a config ever ends up next to the script instead of ~/.hermes-proxy
+config.json
