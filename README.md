@@ -44,18 +44,6 @@ On startup the proxy checks `version.json` on this repo's `main` branch.
 - **Compiled executables** auto-update from GitHub releases and relaunch (opt out with `"auto_update": false` in `~/.hermes-proxy/config.json`). You can also update manually with `--self-update`.
 - **Running from source**: update with `git pull`.
 
-## Cutting a release
-
-```bash
-# 1. Bump VERSION in hermes-bearer-proxy.js AND version.json (keep in sync)
-# 2. Build per-platform executables into dist/
-./build-release.sh
-# 3. Commit + push, then create a GitHub release tagged v<version>
-gh release create v<version> dist/hermes-bearer-proxy-* --title "v<version>"
-```
-
-The tag (`v<version>`) and asset filenames must match what `--self-update` expects; `build-release.sh` names them correctly.
-
 ## License
 
 Personal, non-commercial use only — see [LICENSE](LICENSE).
