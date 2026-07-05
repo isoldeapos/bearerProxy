@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.3.0';
+const VERSION = '1.5.0';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -106,18 +106,11 @@ const UPSTREAM_AGENT = new https.Agent({
 // Fake /v1/models + /v1 responses
 // ---------------------------------------------------------------------------
 // Hand-maintained, not fetched from anywhere real - the gateway has no
-// /v1/models endpoint to query. qwen3.7-max, qwen3.7-plus, deepseek-v4-pro,
-// and deepseek-v4-flash have all been confirmed working through this
-// gateway. glm-5.2 has NOT been confirmed - added per request, but if you
-// actually select it and the gateway doesn't serve that model, expect a
-// real "model does not exist" error back from the gateway at request time.
-const STUB_MODELS = [
-  'qwen3.7-max',
-  'qwen3.7-plus',
-  'deepseek-v4-pro',
-  'deepseek-v4-flash',
-  'glm-5.2', // unconfirmed - see note above
-];
+// /v1/models endpoint to query. The proxy is pinned to a single model: it
+// is the only one advertised on /v1/models, and every proxied request has
+// its model field rewritten to it regardless of what the client asked for.
+const FORCED_MODEL = 'qwen3.7-plus';
+const STUB_MODELS = [FORCED_MODEL];
 
 function sendModelsStub(res) {
   const body = JSON.stringify({
@@ -347,7 +340,7 @@ function openaiToAnthropicRequest(body) {
   }
 
   const anthropicBody = {
-    model: body.model,
+    model: FORCED_MODEL,
     messages: anthropicMessages,
     // Anthropic requires max_tokens; OpenAI doesn't. Newer OpenAI clients
     // send max_completion_tokens instead of max_tokens - honor both.
@@ -580,7 +573,21 @@ async function forwardRaw(req, res) {
   // Buffer the request body so it can be replayed on retry. (The old
   // req.pipe(proxyReq) approach made retries impossible - the body was gone
   // after the first attempt.)
-  const bodyBuffer = await readBodyBuffer(req);
+  let bodyBuffer = await readBodyBuffer(req);
+
+  // Pin native /v1/messages requests (e.g. from Hermes) to the forced model.
+  // Non-JSON or model-less bodies pass through untouched.
+  if (req.method === 'POST' && req.url.startsWith('/v1/messages')) {
+    try {
+      const parsed = JSON.parse(bodyBuffer.toString('utf8'));
+      if (parsed && typeof parsed === 'object' && parsed.model !== FORCED_MODEL) {
+        parsed.model = FORCED_MODEL;
+        bodyBuffer = Buffer.from(JSON.stringify(parsed));
+      }
+    } catch (e) {
+      /* leave body as-is */
+    }
+  }
   delete headers['transfer-encoding'];
   headers['content-length'] = bodyBuffer.length;
 
