@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.6.1';
+const VERSION = '1.6.2';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -637,7 +637,7 @@ async function forwardRaw(req, res) {
       `${req.method} ${req.url}`
     );
   } catch (err) {
-    log.error(`Upstream request failed after retries: `);
+    log.error(`Upstream request failed after retries: ${err.message}`);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(upstreamErrorStatus(err), { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'proxy_upstream_error', message: err.message }));
@@ -648,7 +648,7 @@ async function forwardRaw(req, res) {
   proxyRes.pipe(res);
   // Mid-stream upstream failure - too late to retry, just close out.
   proxyRes.on('error', (err) => {
-    log.error(`Upstream response error mid-stream: `);
+    log.error(`Upstream response error mid-stream: ${err.message}`);
     if (!res.writableEnded) res.end();
   });
 }
@@ -706,7 +706,7 @@ async function handleChatCompletions(req, res) {
       'POST /v1/chat/completions'
     );
   } catch (err) {
-    log.error(`Upstream request failed after retries: `);
+    log.error(`Upstream request failed after retries: ${err.message}`);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(upstreamErrorStatus(err), { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_upstream_error' } }));
@@ -729,7 +729,7 @@ async function handleChatCompletions(req, res) {
       if (!res.writableEnded) res.end();
     });
     proxyRes.on('error', (err) => {
-      log.error(`Upstream stream error mid-response: `);
+      log.error(`Upstream stream error mid-response: ${err.message}`);
       if (!res.writableEnded) res.end();
     });
   } else {
@@ -737,7 +737,7 @@ async function handleChatCompletions(req, res) {
     proxyRes.setEncoding('utf8');
     proxyRes.on('data', (c) => (raw += c));
     proxyRes.on('error', (err) => {
-      log.error(`Upstream response error: `);
+      log.error(`Upstream response error: ${err.message}`);
       if (res.writableEnded) return;
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_upstream_error' } }));
@@ -946,7 +946,7 @@ async function enforceUpdate(repo) {
   if (semverNewer(remote, VERSION)) {
     const how = IS_COMPILED ? 'run with --self-update to install it' : 'update with git pull';
     log.error(`v${remote} is available and you have v${VERSION} - this version will not run until updated. ${how}, then start again.`);
-    process.exit(1);
+    return exitWithPause(1);
   }
   log.update(green(`you're up to date (v${VERSION})`));
 }
@@ -1094,6 +1094,41 @@ async function selfUpdate(repo) {
 }
 
 // ---------------------------------------------------------------------------
+// Relaunch + friendly exits (double-clicked exe ergonomics)
+// ---------------------------------------------------------------------------
+// After an update, start the new binary and let this process exit. On
+// Windows the console window belongs to THIS process and dies with it, so
+// `detached + stdio inherit` would leave the new copy running invisibly
+// (and squatting on the port). Instead, open it in a brand-new console
+// window via `start`. On POSIX the terminal outlives us, so inheriting it
+// keeps the logs in the same window.
+function relaunchDetached(target, args) {
+  const cp = require('child_process');
+  if (process.platform === 'win32') {
+    cp.spawn('cmd.exe', ['/c', 'start', 'hermes-bearer-proxy', target, ...args], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  } else {
+    cp.spawn(target, args, { detached: true, stdio: 'inherit' }).unref();
+  }
+}
+
+// A double-clicked exe's console closes the instant the process exits, so a
+// startup error would just be a window that blinks and vanishes. When
+// running interactively as a compiled exe, hold the window open until Enter
+// so the message can actually be read.
+function exitWithPause(code) {
+  if (IS_COMPILED && process.stdin.isTTY && !process.env.HERMES_SUPERVISED) {
+    console.log('\nPress Enter to close this window...');
+    process.stdin.resume();
+    process.stdin.once('data', () => process.exit(code));
+    return;
+  }
+  process.exit(code);
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
@@ -1117,7 +1152,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && req.url === '/v1/chat/completions') {
     handleChatCompletions(req, res).catch((err) => {
-      log.error(`Translation error: `);
+      log.error(`Translation error: ${err.message}`);
       if (res.writableEnded) return;
       if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_internal_error' } }));
@@ -1128,7 +1163,7 @@ const server = http.createServer((req, res) => {
   // Anything else (notably native /v1/messages from Hermes) - forward as-is
   // with the same Bearer-rewrite, unchanged.
   forwardRaw(req, res).catch((err) => {
-    log.error(`Forward error: `);
+    log.error(`Forward error: ${err.message}`);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'proxy_internal_error', message: err.message }));
@@ -1140,6 +1175,20 @@ const server = http.createServer((req, res) => {
 server.requestTimeout = 0;
 server.headersTimeout = 60000;
 server.keepAliveTimeout = 75000;
+
+// Without this handler a taken port crashes the process instantly - on a
+// double-clicked exe that's a console window that blinks and vanishes.
+// The usual cause is another copy already running (e.g. relaunched after an
+// update), so say exactly that and keep the window open.
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    log.error(`port ${LISTEN_PORT} is already in use - another copy of the proxy is probably already running.`);
+    log.error('Close the other copy first (on Windows: check the taskbar or Task Manager for hermes-bearer-proxy), or set LISTEN_PORT to use a different port.');
+  } else {
+    log.error(`server error: ${err.message}`);
+  }
+  exitWithPause(1);
+});
 
 async function main() {
   if (process.argv.includes('--version')) {
@@ -1192,8 +1241,7 @@ async function main() {
         log.update('exiting so the supervisor restarts the new version');
       } else {
         log.update('relaunching as the new version');
-        const child = require('child_process').spawn(updateTarget, process.argv.slice(2), { detached: true, stdio: 'inherit' });
-        child.unref();
+        relaunchDetached(updateTarget, process.argv.slice(2));
       }
       process.exit(0);
     } catch (err) {
@@ -1202,7 +1250,7 @@ async function main() {
           `could not install the pending update (${err.message}) - refusing to run the outdated version. ` +
             'Check antivirus or cloud-sync (OneDrive/Dropbox) locks on the executable, then start again.'
         );
-        process.exit(1);
+        return exitWithPause(1);
       }
       // Not a lock problem - the saved download is no good here (bad
       // permissions, wrong filesystem, corrupt file). Discard it and fall
@@ -1244,8 +1292,7 @@ async function main() {
         } else {
           const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
           log.update('relaunching as the new version');
-          const child = require('child_process').spawn(target, [], { detached: true, stdio: 'inherit' });
-          child.unref();
+          relaunchDetached(target, process.argv.slice(2));
         }
         process.exit(0);
       }
@@ -1255,7 +1302,7 @@ async function main() {
         // next start installs the saved .new before serving anything.
         log.error(`[update] ${err.message}`);
         log.error('[update] exiting - start again to install the downloaded update');
-        process.exit(1);
+        return exitWithPause(1);
       }
       // Couldn't check or download. If we managed to learn we're outdated,
       // fail closed - an outdated proxy must not run. Otherwise (offline,
@@ -1268,7 +1315,7 @@ async function main() {
       }
       if (outdated) {
         log.error(`[update] auto-update failed (${err.message}) and v${VERSION} is outdated - refusing to start until updated`);
-        process.exit(1);
+        return exitWithPause(1);
       }
       log.warn(`[update] auto-update failed (${err.message}) - could not confirm a newer version, starting v${VERSION}`);
     }
@@ -1296,6 +1343,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Fatal startup error:', err.message);
-  process.exit(1);
+  log.error(`Fatal startup error: ${err.message}`);
+  exitWithPause(1);
 });
