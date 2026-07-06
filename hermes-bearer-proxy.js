@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.6.2';
+const VERSION = '1.6.3';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -1096,22 +1096,50 @@ async function selfUpdate(repo) {
 // ---------------------------------------------------------------------------
 // Relaunch + friendly exits (double-clicked exe ergonomics)
 // ---------------------------------------------------------------------------
-// After an update, start the new binary and let this process exit. On
-// Windows the console window belongs to THIS process and dies with it, so
-// `detached + stdio inherit` would leave the new copy running invisibly
-// (and squatting on the port). Instead, open it in a brand-new console
-// window via `start`. On POSIX the terminal outlives us, so inheriting it
-// keeps the logs in the same window.
-function relaunchDetached(target, args) {
-  const cp = require('child_process');
-  if (process.platform === 'win32') {
-    cp.spawn('cmd.exe', ['/c', 'start', 'hermes-bearer-proxy', target, ...args], {
-      detached: true,
-      stdio: 'ignore',
-    }).unref();
-  } else {
-    cp.spawn(target, args, { detached: true, stdio: 'inherit' }).unref();
-  }
+// After an update, run the new binary as a child in THIS console and wait
+// for it. The window stays open, logs keep streaming into it, and Ctrl+C /
+// closing the window stops the proxy - no orphaned background copy. The old
+// process lingers only as a thin wrapper passing the exit code through.
+function relaunchInPlace(target, args) {
+  const child = require('child_process').spawn(target, args, { stdio: 'inherit' });
+  // Ctrl+C is delivered to every process in the console group. Let the
+  // child handle it and shut down; this wrapper just follows it out.
+  process.on('SIGINT', () => {});
+  process.on('SIGTERM', () => child.kill('SIGTERM'));
+  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('error', (err) => {
+    log.error(`failed to relaunch as the new version: ${err.message}`);
+    exitWithPause(1);
+  });
+}
+
+// Ask a proxy instance already holding our port to shut down (loopback
+// only, so nothing off-machine can reach it). Resolves true only if the
+// other side identifies itself as this proxy - a stranger's server on the
+// port is left alone. Killing our own process this way needs no admin
+// rights and no PID hunting.
+function askExistingInstanceToShutDown() {
+  return new Promise((resolve) => {
+    const req = http.request(
+      { hostname: LISTEN_HOST, port: LISTEN_PORT, path: '/__proxy/shutdown', method: 'POST', timeout: 3000 },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (raw += c));
+        res.on('end', () => {
+          try {
+            resolve(res.statusCode === 200 && JSON.parse(raw).service === 'hermes-bearer-proxy');
+          } catch (e) {
+            resolve(false);
+          }
+        });
+        res.on('error', () => resolve(false));
+      }
+    );
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(false));
+    req.end();
+  });
 }
 
 // A double-clicked exe's console closes the instant the process exits, so a
@@ -1146,6 +1174,17 @@ const server = http.createServer((req, res) => {
     }
   });
 
+  // Another instance starting up wants this port (see
+  // askExistingInstanceToShutDown). Confirm who we are, then bow out.
+  if (req.method === 'POST' && req.url === '/__proxy/shutdown') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ service: 'hermes-bearer-proxy', version: VERSION, shutting_down: true }));
+    log.warn('a new instance is taking over the port - shutting down');
+    server.close();
+    setTimeout(() => process.exit(0), 250);
+    return;
+  }
+
   if (req.method === 'GET' && (req.url === '/v1/models' || req.url === '/v1')) {
     return sendModelsStub(res);
   }
@@ -1178,12 +1217,31 @@ server.keepAliveTimeout = 75000;
 
 // Without this handler a taken port crashes the process instantly - on a
 // double-clicked exe that's a console window that blinks and vanishes.
-// The usual cause is another copy already running (e.g. relaunched after an
-// update), so say exactly that and keep the window open.
-server.on('error', (err) => {
+// The usual cause is another copy of this proxy already running, so first
+// ask it to shut down and take over the port; only give up (with the
+// window held open) if the occupant isn't ours or won't die.
+let takeoverAttempts = 0;
+const TAKEOVER_MAX_ATTEMPTS = 10;
+server.on('error', async (err) => {
   if (err.code === 'EADDRINUSE') {
-    log.error(`port ${LISTEN_PORT} is already in use - another copy of the proxy is probably already running.`);
-    log.error('Close the other copy first (on Windows: check the taskbar or Task Manager for hermes-bearer-proxy), or set LISTEN_PORT to use a different port.');
+    if (takeoverAttempts === 0) {
+      log.warn(`port ${LISTEN_PORT} is in use - checking whether it's another copy of this proxy...`);
+      if (await askExistingInstanceToShutDown()) {
+        log.warn('asked the running copy to shut down - taking over the port');
+        takeoverAttempts++;
+        await sleep(500);
+        server.listen(LISTEN_PORT, LISTEN_HOST);
+        return;
+      }
+    } else if (takeoverAttempts < TAKEOVER_MAX_ATTEMPTS) {
+      // Old copy acknowledged but hasn't released the port yet - keep trying.
+      takeoverAttempts++;
+      await sleep(500);
+      server.listen(LISTEN_PORT, LISTEN_HOST);
+      return;
+    }
+    log.error(`port ${LISTEN_PORT} is already in use and could not be taken over.`);
+    log.error('Close whatever is using it (on Windows: check the taskbar or Task Manager), or set LISTEN_PORT to use a different port.');
   } else {
     log.error(`server error: ${err.message}`);
   }
@@ -1239,11 +1297,10 @@ async function main() {
       log.update(green('update installed'));
       if (process.env.HERMES_SUPERVISED) {
         log.update('exiting so the supervisor restarts the new version');
-      } else {
-        log.update('relaunching as the new version');
-        relaunchDetached(updateTarget, process.argv.slice(2));
+        process.exit(0);
       }
-      process.exit(0);
+      log.update('starting the new version in this window...');
+      return relaunchInPlace(updateTarget, process.argv.slice(2));
     } catch (err) {
       if (LOCK_ERROR_CODES.has(err.code)) {
         log.error(
@@ -1289,12 +1346,11 @@ async function main() {
       if (updated) {
         if (process.env.HERMES_SUPERVISED) {
           log.update('exiting so the supervisor restarts the new version');
-        } else {
-          const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
-          log.update('relaunching as the new version');
-          relaunchDetached(target, process.argv.slice(2));
+          process.exit(0);
         }
-        process.exit(0);
+        const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
+        log.update('starting the new version in this window...');
+        return relaunchInPlace(target, process.argv.slice(2));
       }
     } catch (err) {
       if (err.updateDeferred) {
