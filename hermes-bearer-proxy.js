@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -70,7 +70,7 @@ const IS_COMPILED = (() => {
 let TARGET_HOST;
 let TARGET_PORT;
 
-const LISTEN_PORT = 8787;
+const LISTEN_PORT = parseInt(process.env.LISTEN_PORT, 10) || 8787;
 const LISTEN_HOST = '127.0.0.1';
 const ANTHROPIC_VERSION = '2023-06-01';
 const MAX_BODY_BYTES = 50 * 1024 * 1024; // 50 MB safety cap on request bodies
@@ -92,6 +92,34 @@ const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS, 10) || 600
 const UPSTREAM_RETRIES = parseInt(process.env.UPSTREAM_RETRIES, 10) || 2;
 const RETRY_BASE_DELAY_MS = parseInt(process.env.RETRY_BASE_DELAY_MS, 10) || 500;
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+// ---------------------------------------------------------------------------
+// Logging - timestamped, colored when stdout is a TTY
+// ---------------------------------------------------------------------------
+const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (code, s) => (USE_COLOR ? `\x1b[${code}m${s}\x1b[0m` : s);
+const dim = (s) => paint('2', s);
+const green = (s) => paint('32', s);
+const yellow = (s) => paint('33', s);
+const red = (s) => paint('31', s);
+const cyan = (s) => paint('36', s);
+
+function ts() {
+  return dim(new Date().toISOString().replace('T', ' ').slice(0, 19));
+}
+
+const log = {
+  info: (msg) => console.log(`${ts()} ${msg}`),
+  warn: (msg) => console.warn(`${ts()} ${yellow(msg)}`),
+  error: (msg) => console.error(`${ts()} ${red(msg)}`),
+  update: (msg) => console.log(`${ts()} ${cyan('[update]')} ${msg}`),
+};
+
+function statusColor(code) {
+  if (code >= 500) return red(code);
+  if (code >= 400) return yellow(code);
+  return green(code);
+}
 
 // Reuse upstream TLS connections. Without this, every proxied request pays
 // a fresh TCP + TLS handshake to the gateway - noticeable when many agents
@@ -217,7 +245,7 @@ async function upstreamWithRetry(options, bodyBuffer, ctx, label) {
   for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
     if (attempt > 0) {
       const delay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
-      console.warn(
+      log.warn(
         `[retry] ${label}: ${lastFailure} - attempt ${attempt + 1}/${UPSTREAM_RETRIES + 1} in ${delay}ms`
       );
       await sleep(delay);
@@ -609,7 +637,7 @@ async function forwardRaw(req, res) {
       `${req.method} ${req.url}`
     );
   } catch (err) {
-    console.error('Upstream request failed after retries:', err.message);
+    log.error(`Upstream request failed after retries: `);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(upstreamErrorStatus(err), { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'proxy_upstream_error', message: err.message }));
@@ -620,7 +648,7 @@ async function forwardRaw(req, res) {
   proxyRes.pipe(res);
   // Mid-stream upstream failure - too late to retry, just close out.
   proxyRes.on('error', (err) => {
-    console.error('Upstream response error mid-stream:', err.message);
+    log.error(`Upstream response error mid-stream: `);
     if (!res.writableEnded) res.end();
   });
 }
@@ -678,7 +706,7 @@ async function handleChatCompletions(req, res) {
       'POST /v1/chat/completions'
     );
   } catch (err) {
-    console.error('Upstream request failed after retries:', err.message);
+    log.error(`Upstream request failed after retries: `);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(upstreamErrorStatus(err), { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_upstream_error' } }));
@@ -701,7 +729,7 @@ async function handleChatCompletions(req, res) {
       if (!res.writableEnded) res.end();
     });
     proxyRes.on('error', (err) => {
-      console.error('Upstream stream error mid-response:', err.message);
+      log.error(`Upstream stream error mid-response: `);
       if (!res.writableEnded) res.end();
     });
   } else {
@@ -709,7 +737,7 @@ async function handleChatCompletions(req, res) {
     proxyRes.setEncoding('utf8');
     proxyRes.on('data', (c) => (raw += c));
     proxyRes.on('error', (err) => {
-      console.error('Upstream response error:', err.message);
+      log.error(`Upstream response error: `);
       if (res.writableEnded) return;
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_upstream_error' } }));
@@ -898,17 +926,29 @@ async function fetchRemoteVersion(repo) {
   return JSON.parse(raw).version;
 }
 
-// Startup check: notify only, never blocks or crashes startup.
-function checkForUpdate(repo) {
-  if (!repo) return;
-  fetchRemoteVersion(repo)
-    .then((remote) => {
-      if (semverNewer(remote, VERSION)) {
-        const how = IS_COMPILED ? 'run with --self-update to install it' : 'git pull to update';
-        console.log(`[update] v${remote} is available (you have v${VERSION}) - ${how}`);
-      }
-    })
-    .catch(() => {});
+// Startup gate for setups that can't self-update (running the .js, or
+// auto_update disabled): an outdated proxy REFUSES to start - update first.
+// If the check itself fails (offline, GitHub down) we can't tell whether
+// we're outdated, so we start anyway rather than brick offline users.
+async function enforceUpdate(repo) {
+  if (!repo) {
+    log.update('no update repo configured - skipping update check');
+    return;
+  }
+  log.update('checking for updates...');
+  let remote;
+  try {
+    remote = await fetchRemoteVersion(repo);
+  } catch (err) {
+    log.update(`update check failed (${err.message}) - carrying on`);
+    return;
+  }
+  if (semverNewer(remote, VERSION)) {
+    const how = IS_COMPILED ? 'run with --self-update to install it' : 'update with git pull';
+    log.error(`v${remote} is available and you have v${VERSION} - this version will not run until updated. ${how}, then start again.`);
+    process.exit(1);
+  }
+  log.update(green(`you're up to date (v${VERSION})`));
 }
 
 // ---------------------------------------------------------------------------
@@ -929,59 +969,120 @@ function releaseAssetName() {
   return `hermes-bearer-proxy-${plat}-${process.arch}${ext}`;
 }
 
+// Downloads to `dest`. The transfer streams into dest.part and is renamed to
+// `dest` only once complete, so the existence of `dest` guarantees a whole
+// file - an interrupted download leaves only a .part, which is cleaned up
+// here on failure and again at the next startup.
 async function downloadToFile(url, dest) {
   const res = await httpGetFollow(url);
   if (res.statusCode !== 200) {
     res.resume();
     throw new Error(`download got HTTP ${res.statusCode} for ${url}`);
   }
-  await new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(dest);
-    res.pipe(out);
-    out.on('finish', resolve);
-    out.on('error', reject);
-    res.on('error', reject);
-  });
+  const part = dest + '.part';
+  try {
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(part);
+      res.pipe(out);
+      out.on('finish', resolve);
+      out.on('error', reject);
+      res.on('error', reject);
+    });
+    fs.renameSync(part, dest);
+  } catch (err) {
+    try {
+      fs.unlinkSync(part);
+    } catch (e) {
+      /* nothing to clean */
+    }
+    throw err;
+  }
 }
 
-// Returns true if a new version was installed, false otherwise.
-async function selfUpdate(repo, opts = {}) {
-  if (!repo) {
-    throw new Error(
-      'no update repo configured - set update_repo in ' + CONFIG_PATH + ' or pass UPDATE_REPO=owner/repo'
-    );
+// Some machines (Windows antivirus scans, OneDrive/Dropbox sync locks) hold
+// the executable open and make renames fail with EBUSY/EPERM/EACCES for a
+// few seconds. Retry with backoff before giving up.
+const LOCK_ERROR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+
+async function renameWithRetry(from, to, attempts = 5) {
+  for (let i = 0; ; i++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      if (!LOCK_ERROR_CODES.has(err.code) || i >= attempts - 1) throw err;
+      const delay = 300 * 2 ** i;
+      log.warn(`[update] ${err.code} renaming ${path.basename(from)} -> ${path.basename(to)} (file locked) - retrying in ${delay}ms`);
+      await sleep(delay);
+    }
   }
-  const remote = await fetchRemoteVersion(repo);
-  if (!semverNewer(remote, VERSION)) {
-    if (!opts.quietWhenCurrent) console.log(`Already up to date (v${VERSION}).`);
-    return false;
-  }
-  // HERMES_SELF_UPDATE_TARGET is a test/advanced hook to update a different
-  // file than the running executable.
-  const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
-  if (!process.env.HERMES_SELF_UPDATE_TARGET && !IS_COMPILED) {
-    console.log(
-      `v${remote} is available, but you're running the .js via ${path.basename(process.execPath)} - ` +
-        'update with git pull instead; --self-update only replaces the compiled executable.'
-    );
-    return false;
-  }
-  const url = `${assetBaseUrl(repo)}/v${remote}/${releaseAssetName()}`;
-  console.log(`Updating v${VERSION} -> v${remote}`);
-  console.log(`Downloading ${url}`);
-  const tmp = target + '.new';
-  await downloadToFile(url, tmp);
-  if (process.platform !== 'win32') fs.chmodSync(tmp, 0o755);
+}
+
+// The swap step of selfUpdate, also re-run at startup if a fully-downloaded
+// .new was left behind by a previous run whose swap failed (locked file).
+async function swapInNewBinary(target) {
   if (process.platform === 'win32') {
     try {
       fs.unlinkSync(target + '.old');
     } catch (e) {
       /* no leftover */
     }
-    fs.renameSync(target, target + '.old');
+    await renameWithRetry(target, target + '.old');
   }
-  fs.renameSync(tmp, target);
-  console.log(`Updated to v${remote}.`);
+  await renameWithRetry(target + '.new', target);
+}
+
+// Returns true if a new version was installed, false otherwise. The download
+// goes to <target>.new first and is only swapped into place once complete, so
+// an update interrupted mid-download leaves the current version untouched -
+// the next start just cleans up the leftover .new and runs normally.
+async function selfUpdate(repo) {
+  if (!repo) {
+    throw new Error(
+      'no update repo configured - set update_repo in ' + CONFIG_PATH + ' or pass UPDATE_REPO=owner/repo'
+    );
+  }
+  log.update('checking for updates...');
+  const remote = await fetchRemoteVersion(repo);
+  if (!semverNewer(remote, VERSION)) {
+    log.update(green(`you're up to date (v${VERSION})`));
+    return false;
+  }
+  // HERMES_SELF_UPDATE_TARGET is a test/advanced hook to update a different
+  // file than the running executable.
+  const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
+  if (!process.env.HERMES_SELF_UPDATE_TARGET && !IS_COMPILED) {
+    log.update(
+      `v${remote} is available, but you're running the .js via ${path.basename(process.execPath)} - ` +
+        'update with git pull instead; --self-update only replaces the compiled executable.'
+    );
+    return false;
+  }
+  const url = `${assetBaseUrl(repo)}/v${remote}/${releaseAssetName()}`;
+  log.update(`updating v${VERSION} -> v${remote}`);
+  log.update(`downloading ${url}`);
+  const tmp = target + '.new';
+  await downloadToFile(url, tmp);
+  if (process.platform !== 'win32') fs.chmodSync(tmp, 0o755);
+  try {
+    await swapInNewBinary(target);
+  } catch (err) {
+    if (LOCK_ERROR_CODES.has(err.code)) {
+      // The download is complete and sitting at <target>.new - keep it. The
+      // next startup finishes the swap before doing anything else, so the
+      // update is not lost, just deferred.
+      const e = new Error(
+        `executable is locked (${err.code}) - could not swap in v${remote}. ` +
+          'The download is saved and will be installed on the next start. ' +
+          'If this keeps happening, check antivirus or cloud-sync (OneDrive/Dropbox) locks on the executable.'
+      );
+      e.code = err.code;
+      e.updateDeferred = true;
+      throw e;
+    }
+    throw err;
+  }
+  log.update(green(`updated to v${remote}`));
   return true;
 }
 
@@ -990,8 +1091,18 @@ async function selfUpdate(repo, opts = {}) {
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
   // Logs method + path only, never headers or bodies, so the key is never
-  // written anywhere.
-  console.log(`${req.method} ${req.url}`);
+  // written anywhere. One line when the request arrives, one when the
+  // response finishes (status + duration) or the client bails early.
+  const startedAt = Date.now();
+  log.info(`${dim('-->')} ${req.method} ${req.url}`);
+  res.on('finish', () => {
+    log.info(`${dim('<--')} ${req.method} ${req.url} ${statusColor(res.statusCode)} ${dim(`${Date.now() - startedAt}ms`)}`);
+  });
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      log.warn(`<-- ${req.method} ${req.url} client disconnected after ${Date.now() - startedAt}ms`);
+    }
+  });
 
   if (req.method === 'GET' && (req.url === '/v1/models' || req.url === '/v1')) {
     return sendModelsStub(res);
@@ -999,7 +1110,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'POST' && req.url === '/v1/chat/completions') {
     handleChatCompletions(req, res).catch((err) => {
-      console.error('Translation error:', err.message);
+      log.error(`Translation error: `);
       if (res.writableEnded) return;
       if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_internal_error' } }));
@@ -1010,7 +1121,7 @@ const server = http.createServer((req, res) => {
   // Anything else (notably native /v1/messages from Hermes) - forward as-is
   // with the same Bearer-rewrite, unchanged.
   forwardRaw(req, res).catch((err) => {
-    console.error('Forward error:', err.message);
+    log.error(`Forward error: `);
     if (res.writableEnded) return;
     if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'proxy_internal_error', message: err.message }));
@@ -1029,11 +1140,44 @@ async function main() {
     return;
   }
 
-  // Clean up the leftover from a previous Windows self-update.
-  try {
-    fs.unlinkSync(process.execPath + '.old');
-  } catch (e) {
-    /* none */
+  // Clean up leftovers from a previous self-update: the .old backup from a
+  // completed Windows swap, and any .new.part from a download that was
+  // interrupted mid-transfer. Either way this run starts on the version
+  // that's already installed, as if nothing happened. (A bare .new is NOT
+  // cleaned up - it's a complete download whose swap was deferred; see below.)
+  const updateTarget = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
+  for (const leftover of ['.old', '.new.part']) {
+    try {
+      fs.unlinkSync(updateTarget + leftover);
+      log.update(`removed leftover ${path.basename(updateTarget)}${leftover} from a previous update`);
+    } catch (e) {
+      /* none */
+    }
+  }
+
+  // A fully-downloaded update whose swap failed last time (locked file) -
+  // finish installing it before anything else, then relaunch as the new
+  // version. If the file is still locked, refuse to run the stale version.
+  if ((IS_COMPILED || process.env.HERMES_SELF_UPDATE_TARGET) && fs.existsSync(updateTarget + '.new')) {
+    log.update('found a downloaded update from a previous run - installing it now...');
+    try {
+      await swapInNewBinary(updateTarget);
+      log.update(green('update installed'));
+      if (process.env.HERMES_SUPERVISED) {
+        log.update('exiting so the supervisor restarts the new version');
+      } else {
+        log.update('relaunching as the new version');
+        const child = require('child_process').spawn(updateTarget, process.argv.slice(2), { detached: true, stdio: 'inherit' });
+        child.unref();
+      }
+      process.exit(0);
+    } catch (err) {
+      log.error(
+        `could not install the pending update (${err.message}) - refusing to run the outdated version. ` +
+          'Check antivirus or cloud-sync (OneDrive/Dropbox) locks on the executable, then start again.'
+      );
+      process.exit(1);
+    }
   }
 
   if (process.argv.includes('--self-update')) {
@@ -1057,34 +1201,61 @@ async function main() {
   const canSelfReplace = IS_COMPILED || process.env.HERMES_SELF_UPDATE_TARGET;
   if (canSelfReplace && updateRepo && cfg.auto_update !== false) {
     try {
-      const updated = await selfUpdate(updateRepo, { quietWhenCurrent: true });
+      const updated = await selfUpdate(updateRepo);
       if (updated) {
         if (process.env.HERMES_SUPERVISED) {
-          console.log('[update] exiting so the supervisor restarts the new version');
+          log.update('exiting so the supervisor restarts the new version');
         } else {
           const target = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
-          console.log('[update] relaunching as the new version');
+          log.update('relaunching as the new version');
           const child = require('child_process').spawn(target, [], { detached: true, stdio: 'inherit' });
           child.unref();
         }
         process.exit(0);
       }
     } catch (err) {
-      console.warn(`[update] auto-update failed (${err.message}) - starting current version`);
+      if (err.updateDeferred) {
+        // Download succeeded but the executable was locked. Exit now: the
+        // next start installs the saved .new before serving anything.
+        log.error(`[update] ${err.message}`);
+        log.error('[update] exiting - start again to install the downloaded update');
+        process.exit(1);
+      }
+      // Couldn't check or download. If we managed to learn we're outdated,
+      // fail closed - an outdated proxy must not run. Otherwise (offline,
+      // GitHub down) start the current version rather than brick the user.
+      let outdated = false;
+      try {
+        outdated = semverNewer(await fetchRemoteVersion(updateRepo), VERSION);
+      } catch (e) {
+        /* couldn't tell */
+      }
+      if (outdated) {
+        log.error(`[update] auto-update failed (${err.message}) and v${VERSION} is outdated - refusing to start until updated`);
+        process.exit(1);
+      }
+      log.warn(`[update] auto-update failed (${err.message}) - could not confirm a newer version, starting v${VERSION}`);
     }
   } else {
-    checkForUpdate(updateRepo);
+    await enforceUpdate(updateRepo);
   }
 
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-    console.log(`hermes-bearer-proxy v${VERSION}`);
-    console.log(`Proxy listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
-    console.log(`Forwarding to https://${TARGET_HOST}${TARGET_PORT !== 443 ? `:${TARGET_PORT}` : ''}`);
+    console.log(cyan(String.raw`
+  _  _ ___ ___ __  __ ___ ___   ___ ___  _____  ____   __
+ | || | __| _ \  \/  | __/ __| | _ \ _ \/ _ \ \/ /\ \ / /
+ | __ | _||   / |\/| | _|\__ \ |  _/   / (_) >  <  \ V /
+ |_||_|___|_|_\_|  |_|___|___/ |_| |_|_\\___/_/\_\  |_|
+`));
+    console.log(`   ${green('*')} hermes-bearer-proxy ${green(`v${VERSION}`)}`);
+    console.log(`   ${green('*')} listening on   ${cyan(`http://${LISTEN_HOST}:${LISTEN_PORT}`)}`);
+    console.log(`   ${green('*')} forwarding to  ${cyan(`https://${TARGET_HOST}${TARGET_PORT !== 443 ? `:${TARGET_PORT}` : ''}`)}`);
+    console.log(`   ${green('*')} pinned model   ${cyan(FORCED_MODEL)}`);
     console.log(
-      `Upstream header timeout: ${UPSTREAM_TIMEOUT_MS}ms; retries on 502/503/504 + connection errors: ${UPSTREAM_RETRIES}`
+      `   ${green('*')} upstream: header timeout ${UPSTREAM_TIMEOUT_MS}ms, ${UPSTREAM_RETRIES} retries on 502/503/504 + connection errors`
     );
-    console.log('Translates OpenAI /v1/chat/completions <-> Anthropic /v1/messages, and rewrites auth headers.');
-    console.log('Leave this running while you use Hermes or Odysseus. Ctrl+C to stop.');
+    console.log('   Translates OpenAI /v1/chat/completions <-> Anthropic /v1/messages, and rewrites auth headers.');
+    console.log(`\n   ${green('Script is ready to use!')} Leave this running while you use Hermes or Odysseus. Ctrl+C to stop.\n`);
   });
 }
 
