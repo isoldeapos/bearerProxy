@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.6.3';
+const VERSION = '1.6.4';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -1217,34 +1217,39 @@ server.keepAliveTimeout = 75000;
 
 // Without this handler a taken port crashes the process instantly - on a
 // double-clicked exe that's a console window that blinks and vanishes.
-// The usual cause is another copy of this proxy already running, so first
-// ask it to shut down and take over the port; only give up (with the
-// window held open) if the occupant isn't ours or won't die.
-let takeoverAttempts = 0;
-const TAKEOVER_MAX_ATTEMPTS = 10;
+// The usual cause is another copy of this proxy already running: ask it to
+// shut down, then keep retrying the port. If the occupant isn't ours (an
+// older proxy version or another program), don't give up either - camp on
+// the port and start automatically the moment the user kills the occupant,
+// instead of making them close and reopen this window.
+const PORT_RETRY_MS = 2000;
+const PORT_RETRY_MAX = 150; // ~5 minutes
+let portRetries = 0;
+let takeoverAsked = false;
 server.on('error', async (err) => {
-  if (err.code === 'EADDRINUSE') {
-    if (takeoverAttempts === 0) {
-      log.warn(`port ${LISTEN_PORT} is in use - checking whether it's another copy of this proxy...`);
-      if (await askExistingInstanceToShutDown()) {
-        log.warn('asked the running copy to shut down - taking over the port');
-        takeoverAttempts++;
-        await sleep(500);
-        server.listen(LISTEN_PORT, LISTEN_HOST);
-        return;
-      }
-    } else if (takeoverAttempts < TAKEOVER_MAX_ATTEMPTS) {
-      // Old copy acknowledged but hasn't released the port yet - keep trying.
-      takeoverAttempts++;
-      await sleep(500);
-      server.listen(LISTEN_PORT, LISTEN_HOST);
-      return;
-    }
-    log.error(`port ${LISTEN_PORT} is already in use and could not be taken over.`);
-    log.error('Close whatever is using it (on Windows: check the taskbar or Task Manager), or set LISTEN_PORT to use a different port.');
-  } else {
+  if (err.code !== 'EADDRINUSE') {
     log.error(`server error: ${err.message}`);
+    return exitWithPause(1);
   }
+  if (!takeoverAsked) {
+    takeoverAsked = true;
+    log.warn(`port ${LISTEN_PORT} is in use - checking whether it's another copy of this proxy...`);
+    if (await askExistingInstanceToShutDown()) {
+      log.warn('asked the running copy to shut down - taking over the port');
+    } else {
+      log.warn(`something else is holding port ${LISTEN_PORT} - probably an older version of this proxy, which can't be asked to shut down.`);
+      log.warn('Waiting for the port... kill the other process and this proxy will start by itself.');
+      log.warn(`To find it: netstat -ano | findstr :${LISTEN_PORT}  then: taskkill /PID <pid>  (no admin needed)`);
+    }
+  }
+  if (++portRetries <= PORT_RETRY_MAX) {
+    if (portRetries % 15 === 0) log.warn(`still waiting for port ${LISTEN_PORT} to become free...`);
+    await sleep(PORT_RETRY_MS);
+    server.listen(LISTEN_PORT, LISTEN_HOST);
+    return;
+  }
+  log.error(`port ${LISTEN_PORT} was still busy after 5 minutes - giving up.`);
+  log.error('Close whatever is using it, or set LISTEN_PORT to use a different port, then start again.');
   exitWithPause(1);
 });
 
