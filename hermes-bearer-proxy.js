@@ -48,7 +48,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 
 // Set this to 'owner/repo' before building exes you hand out to other
 // people - it bakes the update source into the binary so they're never
@@ -1063,8 +1063,8 @@ async function selfUpdate(repo) {
   log.update(`downloading ${url}`);
   const tmp = target + '.new';
   await downloadToFile(url, tmp);
-  if (process.platform !== 'win32') fs.chmodSync(tmp, 0o755);
   try {
+    if (process.platform !== 'win32') fs.chmodSync(tmp, 0o755);
     await swapInNewBinary(target);
   } catch (err) {
     if (LOCK_ERROR_CODES.has(err.code)) {
@@ -1079,6 +1079,13 @@ async function selfUpdate(repo) {
       e.code = err.code;
       e.updateDeferred = true;
       throw e;
+    }
+    // Any other failure: the .new is not going to be installed - remove it
+    // so it can't linger or get picked up by a later start.
+    try {
+      fs.unlinkSync(tmp);
+    } catch (e) {
+      /* already gone */
     }
     throw err;
   }
@@ -1146,13 +1153,31 @@ async function main() {
   // that's already installed, as if nothing happened. (A bare .new is NOT
   // cleaned up - it's a complete download whose swap was deferred; see below.)
   const updateTarget = process.env.HERMES_SELF_UPDATE_TARGET || process.execPath;
-  for (const leftover of ['.old', '.new.part']) {
-    try {
-      fs.unlinkSync(updateTarget + leftover);
-      log.update(`removed leftover ${path.basename(updateTarget)}${leftover} from a previous update`);
-    } catch (e) {
-      /* none */
-    }
+  try {
+    fs.unlinkSync(updateTarget + '.new.part');
+    log.update(`removed leftover ${path.basename(updateTarget)}.new.part from a previous update`);
+  } catch (e) {
+    /* none */
+  }
+
+  // The .old backup is the previous executable - on Windows the old process
+  // can still be exiting (or antivirus scanning it) when this one starts, so
+  // a single delete attempt often fails. Keep retrying in the background;
+  // don't hold up startup for it.
+  if (fs.existsSync(updateTarget + '.old')) {
+    (async () => {
+      for (let i = 0; i < 10; i++) {
+        try {
+          fs.unlinkSync(updateTarget + '.old');
+          log.update(`removed leftover ${path.basename(updateTarget)}.old from a previous update`);
+          return;
+        } catch (err) {
+          if (err.code === 'ENOENT') return;
+          await sleep(3000);
+        }
+      }
+      log.warn(`[update] could not remove leftover ${path.basename(updateTarget)}.old (still locked) - will try again next start`);
+    })();
   }
 
   // A fully-downloaded update whose swap failed last time (locked file) -
@@ -1172,11 +1197,22 @@ async function main() {
       }
       process.exit(0);
     } catch (err) {
-      log.error(
-        `could not install the pending update (${err.message}) - refusing to run the outdated version. ` +
-          'Check antivirus or cloud-sync (OneDrive/Dropbox) locks on the executable, then start again.'
-      );
-      process.exit(1);
+      if (LOCK_ERROR_CODES.has(err.code)) {
+        log.error(
+          `could not install the pending update (${err.message}) - refusing to run the outdated version. ` +
+            'Check antivirus or cloud-sync (OneDrive/Dropbox) locks on the executable, then start again.'
+        );
+        process.exit(1);
+      }
+      // Not a lock problem - the saved download is no good here (bad
+      // permissions, wrong filesystem, corrupt file). Discard it and fall
+      // through to the normal update flow, which re-downloads if needed.
+      try {
+        fs.unlinkSync(updateTarget + '.new');
+      } catch (e) {
+        /* already gone */
+      }
+      log.warn(`[update] discarded the pending update (${err.message}) - will re-download if still needed`);
     }
   }
 
